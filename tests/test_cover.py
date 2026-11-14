@@ -1,10 +1,15 @@
 """Tests for the cover entity."""
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from homeassistant.components.cover import CoverDeviceClass, CoverEntityFeature
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed_exact,
+)
 
 from custom_components.tuya_local.const import (
     CONF_DEVICE_ID,
@@ -153,6 +158,8 @@ def _make_cover(
     cover._config = config
     cover._attr_dps = []
     cover._use_control_for_endpoints = False
+    cover._position_command_delay = 0
+    cover._cancel_pending_position = None
     cover._attr_translation_key = None
     cover._attr_translation_placeholders = None
 
@@ -532,6 +539,36 @@ async def test_avatto_set_position(position, expected):
     await cover.async_set_cover_position(position)
 
     device.async_set_properties.assert_awaited_once_with(expected)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_avatto_sends_only_latest_slider_target(hass, freezer, stop):
+    """Handle a slider burst and let an explicit stop take priority."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    device = Mock(get_property={"1": "stop", "2": 90, "3": 90}.get)
+    device.async_set_properties = AsyncMock()
+    cover = TuyaLocalCover(device, entity_config)
+    cover.hass = hass
+
+    for position in (10, 20, 13, 0):
+        await cover.async_set_cover_position(position)
+        freezer.tick(timedelta(seconds=1))
+        async_fire_time_changed_exact(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    device.async_set_properties.assert_not_awaited()
+    if stop:
+        await cover.async_stop_cover()
+    freezer.tick(timedelta(seconds=1))
+    async_fire_time_changed_exact(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    device.async_set_properties.assert_awaited_once_with(
+        {"1": "stop" if stop else "close"}
+    )
 
 
 def test_avatto_motion_feedback():

@@ -355,6 +355,11 @@ class TuyaEntityConfig:
         return icon
 
     @property
+    def position_command_delay(self):
+        """Seconds of quiet to wait before sending a cover position command."""
+        return self._config.get("position_command_delay", 0)
+
+    @property
     def use_control_for_endpoints(self):
         """Whether to use native open and close commands for 100% and 0%."""
         return self._config.get("use_control_for_endpoints", False)

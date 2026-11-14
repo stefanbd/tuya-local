@@ -92,6 +92,11 @@
                         "type": ["boolean", "string"],
                         "description": "true if the entity should be created as disabled by default. Useful for entities that are not commonly used or require advanced knowledge to use. If set to 'unavailable', the entity will be hidden when the 'available' dps indicates false."
                     },
+                    "position_command_delay": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "For covers, wait this many seconds after the last position request before sending it."
+                    },
                     "use_control_for_endpoints": {
                         "type": "boolean",
                         "description": "For covers, use native close and open commands when asked to move to 0% or 100%."

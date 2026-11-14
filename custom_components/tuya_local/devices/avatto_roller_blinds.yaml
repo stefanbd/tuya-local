@@ -7,6 +7,7 @@ entities:
   - entity: cover
     class: blind
     use_control_for_endpoints: true
+    position_command_delay: 1.5
     dps:
       - id: 1
         name: control

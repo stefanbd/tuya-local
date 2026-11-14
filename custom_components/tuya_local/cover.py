@@ -9,6 +9,7 @@ from homeassistant.components.cover import (
     CoverEntity,
     CoverEntityFeature,
 )
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util.percentage import (
     percentage_to_ranged_value,
     ranged_value_to_percentage,
@@ -62,6 +63,8 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._motion_command = None
         self._last_control = None
         self._last_target = None
+        self._position_command_delay = config.position_command_delay
+        self._cancel_pending_position = None
 
         self._support_flags = CoverEntityFeature(0)
         if self._position_dp:
@@ -256,8 +259,18 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         else:
             return state == "closed"
 
+    def _cancel_position_command(self):
+        if self._cancel_pending_position is not None:
+            self._cancel_pending_position()
+            self._cancel_pending_position = None
+
+    async def async_will_remove_from_hass(self):
+        self._cancel_position_command()
+        await super().async_will_remove_from_hass()
+
     async def async_open_cover(self, **kwargs):
         """Open the cover."""
+        self._cancel_position_command()
         if self._control_dp and "open" in self._control_dp.values(self._device):
             _LOGGER.info("%s opening", self._config.config_id)
             await self._control_dp.async_set_value(self._device, "open")
@@ -270,6 +283,7 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
 
     async def async_close_cover(self, **kwargs):
         """Close the cover."""
+        self._cancel_position_command()
         if self._control_dp and "close" in self._control_dp.values(self._device):
             _LOGGER.info("%s closing", self._config.config_id)
             await self._control_dp.async_set_value(self._device, "close")
@@ -284,6 +298,25 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         """Set the cover to a specific position."""
         if position is None:
             raise AttributeError()
+        if not self._position_dp:
+            raise NotImplementedError()
+
+        if not self._position_command_delay or self.hass is None:
+            await self._async_send_position(position)
+            return
+
+        # A slider can send several targets in quick succession.
+        self._cancel_position_command()
+
+        async def send_position(_now):
+            self._cancel_pending_position = None
+            await self._async_send_position(position)
+
+        self._cancel_pending_position = async_call_later(
+            self.hass, self._position_command_delay, send_position
+        )
+
+    async def _async_send_position(self, position):
         if self._use_control_for_endpoints:
             if position == 0 and self.supported_features & CoverEntityFeature.CLOSE:
                 await self.async_close_cover()
@@ -291,13 +324,8 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
             if position == 100 and self.supported_features & CoverEntityFeature.OPEN:
                 await self.async_open_cover()
                 return
-        if self._position_dp:
-            _LOGGER.info(
-                "%s setting position to %d%%", self._config.config_id, position
-            )
-            await self._position_dp.async_set_value(self._device, position)
-        else:
-            raise NotImplementedError()
+        _LOGGER.info("%s setting position to %d%%", self._config.config_id, position)
+        await self._position_dp.async_set_value(self._device, position)
 
     async def async_set_cover_tilt_position(self, tilt_position, **kwargs):
         """Set the cover tilt position."""
@@ -323,6 +351,7 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
 
     async def async_stop_cover(self, **kwargs):
         """Stop the cover."""
+        self._cancel_position_command()
         if self._control_dp and "stop" in self._control_dp.values(self._device):
             _LOGGER.info("%s stopping", self._config.config_id)
             await self._control_dp.async_set_value(self._device, "stop")
