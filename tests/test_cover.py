@@ -13,6 +13,7 @@ from custom_components.tuya_local.const import (
     DOMAIN,
 )
 from custom_components.tuya_local.cover import TuyaLocalCover, async_setup_entry
+from custom_components.tuya_local.helpers.device_config import get_config
 
 
 @pytest.mark.asyncio
@@ -111,6 +112,7 @@ def _make_cover(
     config = MagicMock()
     config.device_class = None
     config.name = "Test Cover"
+    config.use_control_for_endpoints = False
     config.translation_key = None
     config.translation_only_key = None
     config.translation_placeholders = None
@@ -150,6 +152,7 @@ def _make_cover(
     cover._device = device
     cover._config = config
     cover._attr_dps = []
+    cover._use_control_for_endpoints = False
     cover._attr_translation_key = None
     cover._attr_translation_placeholders = None
 
@@ -510,6 +513,66 @@ class TestAsyncSetCoverPosition:
         cover = _make_cover(position=False, action=False)
         with pytest.raises(NotImplementedError):
             await cover.async_set_cover_position(position=50)
+
+
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [(0, {"1": "close"}), (100, {"1": "open"}), (45, {"2": 55})],
+)
+async def test_avatto_set_position(position, expected):
+    """Use native commands at endpoints and keep intermediate position control."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    device = Mock(get_property={"1": "stop", "2": 100, "3": 100}.get)
+    device.async_set_properties = AsyncMock()
+    cover = TuyaLocalCover(device, entity_config)
+
+    await cover.async_set_cover_position(position)
+
+    device.async_set_properties.assert_awaited_once_with(expected)
+
+
+def test_avatto_motion_feedback():
+    """Resolve native stops and numeric targets from the motor's DP sequence."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    dps = {}
+    cover = TuyaLocalCover(Mock(get_property=dps.get), entity_config)
+
+    def receive(update, *, full_poll=False):
+        dps.update(update)
+        cover.on_receive(update, full_poll)
+
+    receive({"1": "close", "2": 100, "3": 100}, full_poll=True)
+    assert (cover.state, cover.current_cover_position) == ("closed", 0)
+
+    receive({"1": "open"})
+    assert cover.state == "opening"
+    receive({"1": "stop", "2": 100, "3": 54, "7": "opening"}, full_poll=True)
+    assert (cover.state, cover.current_cover_position) == ("open", 46)
+
+    receive({"1": "close"})
+    assert cover.state == "closing"
+    receive({"1": "stop"}, full_poll=True)
+    receive({"3": 77})
+    assert (cover.state, cover.current_cover_position) == ("open", 23)
+
+    receive({"1": "close"})
+    receive({"3": 100})
+    assert cover.state == "closed"
+    receive({"2": 75})
+    assert cover.state == "opening"
+    receive({"1": "close", "2": 75, "3": 75, "7": "opening"}, full_poll=True)
+    assert (cover.state, cover.current_cover_position) == ("open", 25)
+    receive({"1": "close"})
+    assert cover.state == "closing"
+
+    dps.pop("3")
+    assert cover.current_cover_position is None
 
 
 class TestAsyncSetCoverTiltPosition:

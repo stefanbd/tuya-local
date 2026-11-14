@@ -161,6 +161,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional("name"): str,
         vol.Optional("class"): str,
         vol.Optional(vol.Or("translation_key", "translation_only_key")): str,
+        vol.Optional("use_control_for_endpoints"): bool,
         vol.Optional("translation_placeholders"): dict[str, str],
         vol.Optional("category"): vol.In(["config", "diagnostic"]),
         vol.Optional("icon"): vol.Match(r"^mdi:"),

@@ -53,6 +53,16 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._open_dp = dps_map.pop("open", None)
         self._init_end(dps_map)
 
+        self._use_control_for_endpoints = (
+            config.use_control_for_endpoints
+            and self._control_dp is not None
+            and self._position_dp is not None
+            and self._currentpos_dp is not None
+        )
+        self._motion_command = None
+        self._last_control = None
+        self._last_target = None
+
         self._support_flags = CoverEntityFeature(0)
         if self._position_dp:
             self._support_flags |= CoverEntityFeature.SET_POSITION
@@ -105,6 +115,10 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
             if pos is not None:
                 return pos
 
+        if self._use_control_for_endpoints:
+            # A target is not a measurement, particularly after a Stop.
+            return None
+
         if self._open_dp:
             state = self._open_dp.get_value(self._device)
             if state is not None:
@@ -129,11 +143,54 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
                 return ranged_value_to_percentage(r, val)
             return val
 
+    def on_receive(self, dps, full_poll):
+        """Identify the latest command from the motor's DP updates."""
+        if not self._use_control_for_endpoints:
+            return
+
+        control_id = self._control_dp.id
+        target_id = self._position_dp.id
+        if control_id in dps:
+            control = dps[control_id]
+            control_changed = (
+                self._last_control is not None and control != self._last_control
+            )
+            if control_changed or target_id not in dps:
+                self._motion_command = self._control_dp.get_value(self._device)
+            self._last_control = control
+
+        if target_id in dps:
+            target = dps[target_id]
+            target_changed = (
+                self._last_target is not None and target != self._last_target
+            )
+            if control_id not in dps or (target_changed and not control_changed):
+                self._motion_command = "position"
+            self._last_target = target
+
+    def _state_from_motion_command(self):
+        """Use the current position and latest command for movement status."""
+        position = self.current_cover_position
+        if position is None:
+            return None
+
+        if self._motion_command == "position":
+            target = self._position_dp.get_value(self._device)
+        else:
+            target = {"open": 100, "close": 0}.get(self._motion_command)
+
+        if target is not None and abs(target - position) > 2:
+            return "opening" if target > position else "closing"
+        return "closed" if position == 0 else "opened"
+
     @property
     def _current_state(self):
         """Return the current state of the cover if it can be determined,
         or None if it is inconclusive.
         """
+        if self._use_control_for_endpoints:
+            return self._state_from_motion_command()
+
         if self._action_dp:
             action = self._action_dp.get_value(self._device)
             if action in ["opening", "closing", "opened", "closed"]:
@@ -227,6 +284,13 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         """Set the cover to a specific position."""
         if position is None:
             raise AttributeError()
+        if self._use_control_for_endpoints:
+            if position == 0 and self.supported_features & CoverEntityFeature.CLOSE:
+                await self.async_close_cover()
+                return
+            if position == 100 and self.supported_features & CoverEntityFeature.OPEN:
+                await self.async_open_cover()
+                return
         if self._position_dp:
             _LOGGER.info(
                 "%s setting position to %d%%", self._config.config_id, position

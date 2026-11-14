@@ -92,6 +92,10 @@
                         "type": ["boolean", "string"],
                         "description": "true if the entity should be created as disabled by default. Useful for entities that are not commonly used or require advanced knowledge to use. If set to 'unavailable', the entity will be hidden when the 'available' dps indicates false."
                     },
+                    "use_control_for_endpoints": {
+                        "type": "boolean",
+                        "description": "For covers, use native close and open commands when asked to move to 0% or 100%."
+                    },
                     "mode": {
                         "type": "string",
                         "enum": ["auto", "box", "slider"],
