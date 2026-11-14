@@ -162,6 +162,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional("class"): str,
         vol.Optional(vol.Or("translation_key", "translation_only_key")): str,
         vol.Optional("use_control_for_endpoints"): bool,
+        vol.Optional("stop_before_retarget"): bool,
         vol.Optional("position_command_delay"): vol.All(
             vol.Any(float, int), vol.Range(min=0, min_included=False)
         ),

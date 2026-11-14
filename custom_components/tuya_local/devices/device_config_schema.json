@@ -97,6 +97,10 @@
                         "exclusiveMinimum": 0,
                         "description": "For covers, wait this many seconds after the last position request before sending it."
                     },
+                    "stop_before_retarget": {
+                        "type": "boolean",
+                        "description": "For covers using native endpoints, stop an unfinished move before sending a replacement target."
+                    },
                     "use_control_for_endpoints": {
                         "type": "boolean",
                         "description": "For covers, use native close and open commands when asked to move to 0% or 100%."

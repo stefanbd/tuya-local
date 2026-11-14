@@ -1,5 +1,6 @@
 """Tests for the cover entity."""
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -158,6 +159,7 @@ def _make_cover(
     cover._config = config
     cover._attr_dps = []
     cover._use_control_for_endpoints = False
+    cover._stop_before_retarget = False
     cover._position_command_delay = 0
     cover._cancel_pending_position = None
     cover._attr_translation_key = None
@@ -551,6 +553,8 @@ async def test_avatto_sends_only_latest_slider_target(hass, freezer, stop):
     device = Mock(get_property={"1": "stop", "2": 90, "3": 90}.get)
     device.async_set_properties = AsyncMock()
     cover = TuyaLocalCover(device, entity_config)
+    cover._stop_before_retarget = False
+    cover._position_command_delay = 1.5
     cover.hass = hass
 
     for position in (10, 20, 13, 0):
@@ -569,6 +573,54 @@ async def test_avatto_sends_only_latest_slider_target(hass, freezer, stop):
     device.async_set_properties.assert_awaited_once_with(
         {"1": "stop" if stop else "close"}
     )
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_avatto_replaces_unfinished_move_with_latest_target(stop):
+    """Start immediately; use native Stop before a replacement target."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    dps = {"1": "stop", "2": 60, "3": 60}
+    device = Mock(get_property=dps.get)
+    cover = TuyaLocalCover(device, entity_config)
+    cover.on_receive(dps, full_poll=True)
+    stopped = asyncio.Event()
+
+    async def write(update):
+        if update == {"1": "stop"}:
+            stopped.set()
+        else:
+            dps.update(update)
+            cover.on_receive(update, full_poll=False)
+
+    device.async_set_properties = AsyncMock(side_effect=write)
+    await cover.async_set_cover_position(14)
+    device.async_set_properties.assert_awaited_once_with({"2": 86})
+    assert (cover.state, cover.current_cover_position) == ("closing", 40)
+
+    close = asyncio.create_task(cover.async_set_cover_position(0))
+    await stopped.wait()
+    final = asyncio.create_task(
+        cover.async_stop_cover() if stop else cover.async_set_cover_position(70)
+    )
+    await asyncio.sleep(0)
+    dps["1"] = "stop"
+    cover.on_receive({"1": "stop"}, full_poll=False)
+    await asyncio.gather(close, final)
+
+    commands = [entry.args[0] for entry in device.async_set_properties.await_args_list]
+    assert commands == [
+        {"2": 86},
+        {"1": "stop"},
+        {"1": "stop"} if stop else {"2": 30},
+    ]
+    if not stop:
+        assert (cover.state, cover.current_cover_position) == ("opening", 40)
+        dps["3"] = 30
+        cover.on_receive({"3": 30}, full_poll=False)
+        assert (cover.state, cover.current_cover_position) == ("open", 70)
 
 
 def test_avatto_motion_feedback():

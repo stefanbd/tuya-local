@@ -2,6 +2,7 @@
 Setup for different kinds of Tuya cover devices
 """
 
+import asyncio
 import logging
 
 from homeassistant.components.cover import (
@@ -21,6 +22,7 @@ from .helpers.config import async_tuya_setup_platform
 from .helpers.device_config import TuyaEntityConfig
 
 _LOGGER = logging.getLogger(__name__)
+_STOP_ACK_TIMEOUT = 0.8
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -63,6 +65,14 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._motion_command = None
         self._last_control = None
         self._last_target = None
+        self._stop_before_retarget = (
+            config.stop_before_retarget and self._use_control_for_endpoints
+        )
+        self._move_lock = asyncio.Lock()
+        self._request_id = 0
+        self._requested_target = None
+        self._retargeting = False
+        self._stop_ack = None
         self._position_command_delay = config.position_command_delay
         self._cancel_pending_position = None
 
@@ -161,6 +171,11 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
             if control_changed or target_id not in dps:
                 self._motion_command = self._control_dp.get_value(self._device)
             self._last_control = control
+            if self._stop_before_retarget and self._motion_command == "stop":
+                if self._stop_ack is not None and (not full_poll or control_changed):
+                    self._stop_ack.set()
+                elif control_changed and not self._retargeting:
+                    self._requested_target = None
 
         if target_id in dps:
             target = dps[target_id]
@@ -171,18 +186,40 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
                 self._motion_command = "position"
             self._last_target = target
 
+        if (
+            self._stop_before_retarget
+            and not self._retargeting
+            and self._currentpos_dp.id in dps
+            and not self._target_pending(
+                self._requested_target, self.current_cover_position
+            )
+        ):
+            self._requested_target = None
+
+    def _observed_target(self):
+        if self._motion_command == "position":
+            return self._position_dp.get_value(self._device)
+        return {"open": 100, "close": 0}.get(self._motion_command)
+
+    def _target_pending(self, target, position):
+        if target is None:
+            return False
+        if position is None:
+            return True
+        tolerance = 0 if self._stop_before_retarget and target in (0, 100) else 2
+        return abs(target - position) > tolerance
+
     def _state_from_motion_command(self):
         """Use the current position and latest command for movement status."""
         position = self.current_cover_position
         if position is None:
             return None
 
-        if self._motion_command == "position":
-            target = self._position_dp.get_value(self._device)
-        else:
-            target = {"open": 100, "close": 0}.get(self._motion_command)
+        target = self._requested_target
+        if target is None:
+            target = self._observed_target()
 
-        if target is not None and abs(target - position) > 2:
+        if self._target_pending(target, position):
             return "opening" if target > position else "closing"
         return "closed" if position == 0 else "opened"
 
@@ -272,8 +309,11 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         """Open the cover."""
         self._cancel_position_command()
         if self._control_dp and "open" in self._control_dp.values(self._device):
-            _LOGGER.info("%s opening", self._config.config_id)
-            await self._control_dp.async_set_value(self._device, "open")
+            if self._stop_before_retarget:
+                await self._async_retarget(100)
+            else:
+                _LOGGER.info("%s opening", self._config.config_id)
+                await self._control_dp.async_set_value(self._device, "open")
         elif self._position_dp:
             pos = 100
             _LOGGER.info("%s opening to 100%%", self._config.config_id)
@@ -285,8 +325,11 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         """Close the cover."""
         self._cancel_position_command()
         if self._control_dp and "close" in self._control_dp.values(self._device):
-            _LOGGER.info("%s closing", self._config.config_id)
-            await self._control_dp.async_set_value(self._device, "close")
+            if self._stop_before_retarget:
+                await self._async_retarget(0)
+            else:
+                _LOGGER.info("%s closing", self._config.config_id)
+                await self._control_dp.async_set_value(self._device, "close")
         elif self._position_dp:
             pos = 0
             _LOGGER.info("%s closing to 0%%", self._config.config_id)
@@ -300,6 +343,10 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
             raise AttributeError()
         if not self._position_dp:
             raise NotImplementedError()
+
+        if self._stop_before_retarget:
+            await self._async_retarget(position)
+            return
 
         if not self._position_command_delay or self.hass is None:
             await self._async_send_position(position)
@@ -315,6 +362,54 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._cancel_pending_position = async_call_later(
             self.hass, self._position_command_delay, send_position
         )
+
+    async def _async_retarget(self, position):
+        """Interrupt an unfinished move before sending the newest target."""
+        self._request_id += 1
+        request_id = self._request_id
+        async with self._move_lock:
+            if request_id != self._request_id:
+                return
+            previous = self._requested_target
+            if previous is None:
+                previous = self._observed_target()
+            self._requested_target = position
+            self._retargeting = True
+            try:
+                if self.hass is not None:
+                    self.async_write_ha_state()
+                if (
+                    previous != position
+                    and self.supported_features & CoverEntityFeature.STOP
+                    and self._target_pending(previous, self.current_cover_position)
+                ):
+                    self._stop_ack = asyncio.Event()
+                    try:
+                        await self._control_dp.async_set_value(self._device, "stop")
+                        await asyncio.wait_for(
+                            self._stop_ack.wait(), timeout=_STOP_ACK_TIMEOUT
+                        )
+                    except TimeoutError:
+                        _LOGGER.debug("%s stop was not acknowledged", self.name)
+                    finally:
+                        self._stop_ack = None
+                    if request_id != self._request_id:
+                        self._requested_target = None
+                        return
+                if position == 0 and self.supported_features & CoverEntityFeature.CLOSE:
+                    await self._control_dp.async_set_value(self._device, "close")
+                elif (
+                    position == 100
+                    and self.supported_features & CoverEntityFeature.OPEN
+                ):
+                    await self._control_dp.async_set_value(self._device, "open")
+                else:
+                    await self._position_dp.async_set_value(self._device, position)
+            except Exception:
+                self._requested_target = None
+                raise
+            finally:
+                self._retargeting = False
 
     async def _async_send_position(self, position):
         if self._use_control_for_endpoints:
@@ -354,6 +449,12 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._cancel_position_command()
         if self._control_dp and "stop" in self._control_dp.values(self._device):
             _LOGGER.info("%s stopping", self._config.config_id)
-            await self._control_dp.async_set_value(self._device, "stop")
+            if self._stop_before_retarget:
+                self._request_id += 1
+                async with self._move_lock:
+                    self._requested_target = None
+                    await self._control_dp.async_set_value(self._device, "stop")
+            else:
+                await self._control_dp.async_set_value(self._device, "stop")
         else:
             raise NotImplementedError()

@@ -651,6 +651,7 @@ Either **position**, **action** or **open** should be specified otherwise the co
 - **position** (optional, number 0-100): a dp to control the percentage that the cover is open.
     0 means completely close, 100 means completely open.
 - **position_command_delay** (optional entity setting, in seconds): wait for position requests to settle before sending the latest position to the motor. Open, close, and stop actions cancel a pending position request.
+- **stop_before_retarget** (optional entity setting, default false): when using native endpoints, send Stop before replacing an unfinished move. Use this when the motor accepts new targets but does not reliably change course during a move.
 - **use_control_for_endpoints** (optional entity setting, default false): use the native **control** commands when setting the position to 0 or 100. Use this when the device only reports the stopped position correctly after a native close or open command.
 - **current_position** (optional, number 0-100): a dp to report the current percentage that the cover is open. This is required to get feedback from the curtain even if **position** is the same dp, as some curtains always report the last user set position even after the curtain is changed from another source so we need to be able to ignore the position reported by those devices.
 - **control** (optional, mapping of strings): a dp to control the cover. Mainly useful if **position** cannot be used.
