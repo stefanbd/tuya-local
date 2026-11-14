@@ -6,6 +6,9 @@ products:
 entities:
   - entity: cover
     class: blind
+    use_control_for_endpoints: true
+    stop_before_retarget: true
+    restart_after_position_stop: true
     dps:
       - id: 1
         name: control
@@ -36,28 +39,6 @@ entities:
         range:
           min: 0
           max: 100
-      - id: 7
-        name: action
-        type: string
-        optional: true
-        persist: false
-        mapping:
-          - dps_val: opening
-            value: opening
-            constraint: current_position
-            conditions:
-              - dps_val: 0
-                value: opened
-              - dps_val: null
-                value: null
-          - dps_val: closing
-            value: closing
-            constraint: current_position
-            conditions:
-              - dps_val: 100
-                value: closed
-              - dps_val: null
-                value: null
   - entity: select
     translation_key: timer
     category: config

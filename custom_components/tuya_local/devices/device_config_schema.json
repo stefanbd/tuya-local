@@ -92,6 +92,23 @@
                         "type": ["boolean", "string"],
                         "description": "true if the entity should be created as disabled by default. Useful for entities that are not commonly used or require advanced knowledge to use. If set to 'unavailable', the entity will be hidden when the 'available' dps indicates false."
                     },
+                    "position_command_delay": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "For covers, wait this many seconds after the last position request before sending it."
+                    },
+                    "restart_after_position_stop": {
+                        "type": "boolean",
+                        "description": "For a cover whose numeric retarget stops motion, wait for its stopped-position report, then send the latest target once."
+                    },
+                    "stop_before_retarget": {
+                        "type": "boolean",
+                        "description": "For covers using native endpoints, stop an unfinished move before sending a replacement target."
+                    },
+                    "use_control_for_endpoints": {
+                        "type": "boolean",
+                        "description": "For covers, use native close and open commands when asked to move to 0% or 100%."
+                    },
                     "mode": {
                         "type": "string",
                         "enum": ["auto", "box", "slider"],

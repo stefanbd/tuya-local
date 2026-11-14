@@ -1,10 +1,16 @@
 """Tests for the cover entity."""
 
+import asyncio
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from homeassistant.components.cover import CoverDeviceClass, CoverEntityFeature
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed_exact,
+)
 
 from custom_components.tuya_local.const import (
     CONF_DEVICE_ID,
@@ -13,6 +19,7 @@ from custom_components.tuya_local.const import (
     DOMAIN,
 )
 from custom_components.tuya_local.cover import TuyaLocalCover, async_setup_entry
+from custom_components.tuya_local.helpers.device_config import get_config
 
 
 @pytest.mark.asyncio
@@ -111,6 +118,7 @@ def _make_cover(
     config = MagicMock()
     config.device_class = None
     config.name = "Test Cover"
+    config.use_control_for_endpoints = False
     config.translation_key = None
     config.translation_only_key = None
     config.translation_placeholders = None
@@ -150,6 +158,11 @@ def _make_cover(
     cover._device = device
     cover._config = config
     cover._attr_dps = []
+    cover._use_control_for_endpoints = False
+    cover._restart_after_position_stop = False
+    cover._stop_before_retarget = False
+    cover._position_command_delay = 0
+    cover._cancel_pending_position = None
     cover._attr_translation_key = None
     cover._attr_translation_placeholders = None
 
@@ -510,6 +523,226 @@ class TestAsyncSetCoverPosition:
         cover = _make_cover(position=False, action=False)
         with pytest.raises(NotImplementedError):
             await cover.async_set_cover_position(position=50)
+
+
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [(0, {"1": "close"}), (100, {"1": "open"}), (45, {"2": 55})],
+)
+async def test_avatto_set_position(position, expected):
+    """Use native commands at endpoints and keep intermediate position control."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    device = Mock(get_property={"1": "stop", "2": 100, "3": 100}.get)
+    device.async_set_properties = AsyncMock()
+    cover = TuyaLocalCover(device, entity_config)
+    cover._restart_after_position_stop = False
+
+    await cover.async_set_cover_position(position)
+
+    device.async_set_properties.assert_awaited_once_with(expected)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_avatto_sends_only_latest_slider_target(hass, freezer, stop):
+    """Handle a slider burst and let an explicit stop take priority."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    device = Mock(get_property={"1": "stop", "2": 90, "3": 90}.get)
+    device.async_set_properties = AsyncMock()
+    cover = TuyaLocalCover(device, entity_config)
+    cover._restart_after_position_stop = False
+    cover._stop_before_retarget = False
+    cover._position_command_delay = 1.5
+    cover.hass = hass
+
+    for position in (10, 20, 13, 0):
+        await cover.async_set_cover_position(position)
+        freezer.tick(timedelta(seconds=1))
+        async_fire_time_changed_exact(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+    device.async_set_properties.assert_not_awaited()
+    if stop:
+        await cover.async_stop_cover()
+    freezer.tick(timedelta(seconds=1))
+    async_fire_time_changed_exact(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    device.async_set_properties.assert_awaited_once_with(
+        {"1": "stop" if stop else "close"}
+    )
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_avatto_replaces_unfinished_move_with_latest_target(stop):
+    """Start immediately; use native Stop before a replacement target."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    dps = {"1": "stop", "2": 60, "3": 60}
+    device = Mock(get_property=dps.get)
+    cover = TuyaLocalCover(device, entity_config)
+    cover._restart_after_position_stop = False
+    cover.on_receive(dps, full_poll=True)
+    stopped = asyncio.Event()
+
+    async def write(update):
+        if update == {"1": "stop"}:
+            stopped.set()
+        else:
+            dps.update(update)
+            cover.on_receive(update, full_poll=False)
+
+    device.async_set_properties = AsyncMock(side_effect=write)
+    await cover.async_set_cover_position(14)
+    device.async_set_properties.assert_awaited_once_with({"2": 86})
+    assert (cover.state, cover.current_cover_position) == ("closing", 40)
+
+    close = asyncio.create_task(cover.async_set_cover_position(0))
+    await stopped.wait()
+    final = asyncio.create_task(
+        cover.async_stop_cover() if stop else cover.async_set_cover_position(70)
+    )
+    await asyncio.sleep(0)
+    dps["1"] = "stop"
+    cover.on_receive({"1": "stop"}, full_poll=False)
+    await asyncio.gather(close, final)
+
+    commands = [entry.args[0] for entry in device.async_set_properties.await_args_list]
+    assert commands == [
+        {"2": 86},
+        {"1": "stop"},
+        {"1": "stop"} if stop else {"2": 30},
+    ]
+    if not stop:
+        assert (cover.state, cover.current_cover_position) == ("opening", 40)
+        dps["3"] = 30
+        cover.on_receive({"3": 30}, full_poll=False)
+        assert (cover.state, cover.current_cover_position) == ("open", 70)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_avatto_numeric_retarget_waits_for_measured_stop(hass, stop):
+    """A reversal is resumed once, only after the measured stopped position."""
+    config = get_config("avatto_roller_blinds")
+    ec = next(entity for entity in config.all_entities() if entity.entity == "cover")
+    dps = {"1": "close", "2": 100, "3": 100}
+    device = Mock(get_property=dps.get)
+    cover = TuyaLocalCover(device, ec)
+    cover.hass = hass
+    cover.async_write_ha_state = Mock()
+    cover.on_receive(dps, full_poll=True)
+
+    def receive(update, full_poll=False):
+        dps.update(update)
+        cover.on_receive(update, full_poll)
+
+    async def write(update):
+        receive(update)
+
+    device.async_set_properties = AsyncMock(side_effect=write)
+    await cover.async_set_cover_position(70)
+    await cover.async_set_cover_position(70)
+    device.async_set_properties.assert_awaited_once_with({"2": 30})
+    await cover.async_set_cover_position(0)
+    assert device.async_set_properties.await_count == 2
+    receive({"1": "close", "2": 100, "3": 100}, full_poll=True)
+    # A status response may arrive via receive(), after status() read an ACK.
+    receive({"1": "close", "2": 100, "3": 100}, full_poll=False)
+    await hass.async_block_till_done()
+    assert device.async_set_properties.await_count == 2
+    receive({"3": 79})
+    if stop:
+        await cover.async_stop_cover()
+    await hass.async_block_till_done()
+    commands = [entry.args[0] for entry in device.async_set_properties.await_args_list]
+    assert commands[:2] == [{"2": 30}, {"2": 100}]
+    if stop:
+        assert len(commands) == 2
+        assert (cover.state, cover.current_cover_position) == ("open", 21)
+    else:
+        assert commands[2:] == [{"2": 100}]
+        receive({"3": 100})
+        assert (cover.state, cover.current_cover_position) == ("closed", 0)
+
+
+async def test_avatto_same_direction_continues_without_restarting(hass):
+    """A target farther in the same direction continues until completion."""
+    config = get_config("avatto_roller_blinds")
+    ec = next(entity for entity in config.all_entities() if entity.entity == "cover")
+    dps = {"1": "close", "2": 30, "3": 30}
+    device = Mock(get_property=dps.get)
+    cover = TuyaLocalCover(device, ec)
+    cover.hass = hass
+    cover.async_write_ha_state = Mock()
+    cover.on_receive(dps, full_poll=True)
+
+    def receive(update, full_poll=False):
+        dps.update(update)
+        cover.on_receive(update, full_poll)
+
+    async def write(update):
+        receive(update)
+
+    device.async_set_properties = AsyncMock(side_effect=write)
+    await cover.async_set_cover_position(20)
+    await cover.async_set_cover_position(0)
+    receive({"1": "close", "2": 100, "3": 30}, full_poll=True)
+    await hass.async_block_till_done()
+    receive({"3": 100})
+    await hass.async_block_till_done()
+    assert [call.args[0] for call in device.async_set_properties.await_args_list] == [
+        {"2": 80},
+        {"2": 100},
+    ]
+    assert cover.state == "closed"
+
+
+def test_avatto_motion_feedback():
+    """Resolve native stops and numeric targets from the motor's DP sequence."""
+    config = get_config("avatto_roller_blinds")
+    entity_config = next(
+        entity for entity in config.all_entities() if entity.entity == "cover"
+    )
+    dps = {}
+    cover = TuyaLocalCover(Mock(get_property=dps.get), entity_config)
+
+    def receive(update, *, full_poll=False):
+        dps.update(update)
+        cover.on_receive(update, full_poll)
+
+    receive({"1": "close", "2": 100, "3": 100}, full_poll=True)
+    assert (cover.state, cover.current_cover_position) == ("closed", 0)
+
+    receive({"1": "open"})
+    assert cover.state == "opening"
+    receive({"1": "stop", "2": 100, "3": 54, "7": "opening"}, full_poll=True)
+    assert (cover.state, cover.current_cover_position) == ("open", 46)
+
+    receive({"1": "close"})
+    assert cover.state == "closing"
+    receive({"1": "stop"}, full_poll=True)
+    receive({"3": 77})
+    assert (cover.state, cover.current_cover_position) == ("open", 23)
+
+    receive({"1": "close"})
+    receive({"3": 100})
+    assert cover.state == "closed"
+    receive({"2": 75})
+    assert cover.state == "opening"
+    receive({"1": "close", "2": 75, "3": 75, "7": "opening"}, full_poll=True)
+    assert (cover.state, cover.current_cover_position) == ("open", 25)
+    receive({"1": "close"})
+    assert cover.state == "closing"
+
+    dps.pop("3")
+    assert cover.current_cover_position is None
 
 
 class TestAsyncSetCoverTiltPosition:

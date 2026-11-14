@@ -355,6 +355,26 @@ class TuyaEntityConfig:
         return icon
 
     @property
+    def position_command_delay(self):
+        """Seconds of quiet to wait before sending a cover position command."""
+        return self._config.get("position_command_delay", 0)
+
+    @property
+    def stop_before_retarget(self):
+        """Whether an unfinished cover move needs Stop before the next target."""
+        return self._config.get("stop_before_retarget", False)
+
+    @property
+    def restart_after_position_stop(self):
+        """Whether a changed numeric target stops the motor before restarting."""
+        return self._config.get("restart_after_position_stop", False)
+
+    @property
+    def use_control_for_endpoints(self):
+        """Whether to use native open and close commands for 100% and 0%."""
+        return self._config.get("use_control_for_endpoints", False)
+
+    @property
     def mode(self):
         """Return the mode (used by Number entities)."""
         return self._config.get("mode")
