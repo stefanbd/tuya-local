@@ -159,6 +159,7 @@ def _make_cover(
     cover._config = config
     cover._attr_dps = []
     cover._use_control_for_endpoints = False
+    cover._restart_after_position_stop = False
     cover._stop_before_retarget = False
     cover._position_command_delay = 0
     cover._cancel_pending_position = None
@@ -537,6 +538,7 @@ async def test_avatto_set_position(position, expected):
     device = Mock(get_property={"1": "stop", "2": 100, "3": 100}.get)
     device.async_set_properties = AsyncMock()
     cover = TuyaLocalCover(device, entity_config)
+    cover._restart_after_position_stop = False
 
     await cover.async_set_cover_position(position)
 
@@ -553,6 +555,7 @@ async def test_avatto_sends_only_latest_slider_target(hass, freezer, stop):
     device = Mock(get_property={"1": "stop", "2": 90, "3": 90}.get)
     device.async_set_properties = AsyncMock()
     cover = TuyaLocalCover(device, entity_config)
+    cover._restart_after_position_stop = False
     cover._stop_before_retarget = False
     cover._position_command_delay = 1.5
     cover.hass = hass
@@ -585,6 +588,7 @@ async def test_avatto_replaces_unfinished_move_with_latest_target(stop):
     dps = {"1": "stop", "2": 60, "3": 60}
     device = Mock(get_property=dps.get)
     cover = TuyaLocalCover(device, entity_config)
+    cover._restart_after_position_stop = False
     cover.on_receive(dps, full_poll=True)
     stopped = asyncio.Event()
 
@@ -621,6 +625,83 @@ async def test_avatto_replaces_unfinished_move_with_latest_target(stop):
         dps["3"] = 30
         cover.on_receive({"3": 30}, full_poll=False)
         assert (cover.state, cover.current_cover_position) == ("open", 70)
+
+
+@pytest.mark.parametrize("stop", [False, True])
+async def test_avatto_numeric_retarget_waits_for_measured_stop(hass, stop):
+    """A reversal is resumed once, only after the measured stopped position."""
+    config = get_config("avatto_roller_blinds")
+    ec = next(entity for entity in config.all_entities() if entity.entity == "cover")
+    dps = {"1": "close", "2": 100, "3": 100}
+    device = Mock(get_property=dps.get)
+    cover = TuyaLocalCover(device, ec)
+    cover.hass = hass
+    cover.async_write_ha_state = Mock()
+    cover.on_receive(dps, full_poll=True)
+
+    def receive(update, full_poll=False):
+        dps.update(update)
+        cover.on_receive(update, full_poll)
+
+    async def write(update):
+        receive(update)
+
+    device.async_set_properties = AsyncMock(side_effect=write)
+    await cover.async_set_cover_position(70)
+    await cover.async_set_cover_position(70)
+    device.async_set_properties.assert_awaited_once_with({"2": 30})
+    await cover.async_set_cover_position(0)
+    assert device.async_set_properties.await_count == 2
+    receive({"1": "close", "2": 100, "3": 100}, full_poll=True)
+    # A status response may arrive via receive(), after status() read an ACK.
+    receive({"1": "close", "2": 100, "3": 100}, full_poll=False)
+    await hass.async_block_till_done()
+    assert device.async_set_properties.await_count == 2
+    receive({"3": 79})
+    if stop:
+        await cover.async_stop_cover()
+    await hass.async_block_till_done()
+    commands = [entry.args[0] for entry in device.async_set_properties.await_args_list]
+    assert commands[:2] == [{"2": 30}, {"2": 100}]
+    if stop:
+        assert len(commands) == 2
+        assert (cover.state, cover.current_cover_position) == ("open", 21)
+    else:
+        assert commands[2:] == [{"2": 100}]
+        receive({"3": 100})
+        assert (cover.state, cover.current_cover_position) == ("closed", 0)
+
+
+async def test_avatto_same_direction_continues_without_restarting(hass):
+    """A target farther in the same direction continues until completion."""
+    config = get_config("avatto_roller_blinds")
+    ec = next(entity for entity in config.all_entities() if entity.entity == "cover")
+    dps = {"1": "close", "2": 30, "3": 30}
+    device = Mock(get_property=dps.get)
+    cover = TuyaLocalCover(device, ec)
+    cover.hass = hass
+    cover.async_write_ha_state = Mock()
+    cover.on_receive(dps, full_poll=True)
+
+    def receive(update, full_poll=False):
+        dps.update(update)
+        cover.on_receive(update, full_poll)
+
+    async def write(update):
+        receive(update)
+
+    device.async_set_properties = AsyncMock(side_effect=write)
+    await cover.async_set_cover_position(20)
+    await cover.async_set_cover_position(0)
+    receive({"1": "close", "2": 100, "3": 30}, full_poll=True)
+    await hass.async_block_till_done()
+    receive({"3": 100})
+    await hass.async_block_till_done()
+    assert [call.args[0] for call in device.async_set_properties.await_args_list] == [
+        {"2": 80},
+        {"2": 100},
+    ]
+    assert cover.state == "closed"
 
 
 def test_avatto_motion_feedback():

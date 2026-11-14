@@ -10,6 +10,7 @@ from homeassistant.components.cover import (
     CoverEntity,
     CoverEntityFeature,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util.percentage import (
     percentage_to_ranged_value,
@@ -68,6 +69,11 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._stop_before_retarget = (
             config.stop_before_retarget and self._use_control_for_endpoints
         )
+        self._restart_after_position_stop = config.restart_after_position_stop
+        self._position_resume_task = None
+        self._position_resume_used = False
+        self._position_stop_requested = False
+        self._position_moving = False
         self._move_lock = asyncio.Lock()
         self._request_id = 0
         self._requested_target = None
@@ -161,6 +167,26 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         if not self._use_control_for_endpoints:
             return
 
+        if (
+            self._restart_after_position_stop
+            and self._currentpos_dp.id in dps
+            and len(dps) == 1
+        ):
+            # This MCU pushes a measured position when it stops. Periodic
+            # cached snapshots during travel do not establish a stop.
+            self._position_moving = False
+            target = self._requested_target
+            if (
+                self._target_pending(target, self.current_cover_position)
+                and not self._position_resume_used
+                and self.hass is not None
+            ):
+                self._position_resume_used = True
+                self._position_resume_task = self.hass.async_create_task(
+                    self._async_resume_position(self._request_id, target),
+                    eager_start=False,
+                )
+
         control_id = self._control_dp.id
         target_id = self._position_dp.id
         if control_id in dps:
@@ -190,6 +216,7 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
             self._stop_before_retarget
             and not self._retargeting
             and self._currentpos_dp.id in dps
+            and (not self._restart_after_position_stop or len(dps) == 1)
             and not self._target_pending(
                 self._requested_target, self.current_cover_position
             )
@@ -215,6 +242,12 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         if position is None:
             return None
 
+        if (
+            self._restart_after_position_stop
+            and self._position_stop_requested
+            and not self._position_moving
+        ):
+            return "closed" if position == 0 else "opened"
         target = self._requested_target
         if target is None:
             target = self._observed_target()
@@ -303,11 +336,17 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
 
     async def async_will_remove_from_hass(self):
         self._cancel_position_command()
+        self._request_id += 1
+        if self._position_resume_task is not None:
+            self._position_resume_task.cancel()
         await super().async_will_remove_from_hass()
 
     async def async_open_cover(self, **kwargs):
         """Open the cover."""
         self._cancel_position_command()
+        if self._restart_after_position_stop:
+            await self._async_position_request(100)
+            return
         if self._control_dp and "open" in self._control_dp.values(self._device):
             if self._stop_before_retarget:
                 await self._async_retarget(100)
@@ -324,6 +363,9 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
     async def async_close_cover(self, **kwargs):
         """Close the cover."""
         self._cancel_position_command()
+        if self._restart_after_position_stop:
+            await self._async_position_request(0)
+            return
         if self._control_dp and "close" in self._control_dp.values(self._device):
             if self._stop_before_retarget:
                 await self._async_retarget(0)
@@ -344,6 +386,9 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         if not self._position_dp:
             raise NotImplementedError()
 
+        if self._restart_after_position_stop:
+            await self._async_position_request(position)
+            return
         if self._stop_before_retarget:
             await self._async_retarget(position)
             return
@@ -362,6 +407,58 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
         self._cancel_pending_position = async_call_later(
             self.hass, self._position_command_delay, send_position
         )
+
+    async def _async_position_request(self, position, *, stop=False):
+        """Send numeric targets and resume a reversal only on measured feedback."""
+        self._request_id += 1
+        request_id = self._request_id
+        async with self._move_lock:
+            if request_id != self._request_id:
+                return
+            if (
+                not stop
+                and self._position_moving
+                and position == self._requested_target
+            ):
+                return
+            self._position_resume_used = False
+            self._retargeting = True
+            try:
+                self._position_stop_requested = stop
+                if stop:
+                    self._requested_target = None
+                    self._motion_command = "stop"
+                    if not self._position_moving:
+                        return
+                    # A numeric command back towards the last measured position
+                    # stops an ongoing numeric move on this MCU.
+                else:
+                    self._requested_target = position
+                    if self.hass is not None:
+                        self.async_write_ha_state()
+                self._position_moving = True
+                await self._position_dp.async_set_value(self._device, position)
+            except Exception:
+                self._requested_target = None
+                raise
+            finally:
+                self._retargeting = False
+
+    async def _async_resume_position(self, request_id, position):
+        """Resume once, only after the MCU reports stopping short of the target."""
+        async with self._move_lock:
+            if (
+                request_id != self._request_id
+                or self._requested_target != position
+                or self._position_moving
+            ):
+                return
+            self._position_moving = True
+            try:
+                await self._position_dp.async_set_value(self._device, position)
+            except Exception:
+                self._position_moving = False
+                raise
 
     async def _async_retarget(self, position):
         """Interrupt an unfinished move before sending the newest target."""
@@ -447,6 +544,12 @@ class TuyaLocalCover(TuyaLocalEntity, CoverEntity):
     async def async_stop_cover(self, **kwargs):
         """Stop the cover."""
         self._cancel_position_command()
+        if self._restart_after_position_stop:
+            position = self.current_cover_position
+            if position is None:
+                raise HomeAssistantError("Cannot stop without a measured position")
+            await self._async_position_request(position, stop=True)
+            return
         if self._control_dp and "stop" in self._control_dp.values(self._device):
             _LOGGER.info("%s stopping", self._config.config_id)
             if self._stop_before_retarget:

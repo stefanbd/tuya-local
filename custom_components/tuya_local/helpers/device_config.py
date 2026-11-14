@@ -365,6 +365,11 @@ class TuyaEntityConfig:
         return self._config.get("stop_before_retarget", False)
 
     @property
+    def restart_after_position_stop(self):
+        """Whether a changed numeric target stops the motor before restarting."""
+        return self._config.get("restart_after_position_stop", False)
+
+    @property
     def use_control_for_endpoints(self):
         """Whether to use native open and close commands for 100% and 0%."""
         return self._config.get("use_control_for_endpoints", False)

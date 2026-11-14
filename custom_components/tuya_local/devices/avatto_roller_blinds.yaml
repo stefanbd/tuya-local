@@ -8,6 +8,7 @@ entities:
     class: blind
     use_control_for_endpoints: true
     stop_before_retarget: true
+    restart_after_position_stop: true
     dps:
       - id: 1
         name: control
